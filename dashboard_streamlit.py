@@ -103,7 +103,7 @@ OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 
 @lru_cache(maxsize=128)
-def geocode_city(query: str, count: int = 5) -> List[Dict]:
+def geocode_city(query: str, count: int = 5, country_code: str = None) -> List[Dict]:
     """Consulta a API de geocodificação da Open-Meteo e retorna possíveis cidades."""
     if not query or len(query.strip()) < 3:
         return []
@@ -122,23 +122,30 @@ def geocode_city(query: str, count: int = 5) -> List[Dict]:
             continue
         params = {
             "name": term,
-            "count": count,
+            "count": count * 2 if country_code else count,  # Busca mais se filtrar por país
             "language": "pt",
             "format": "json"
         }
+        # Adiciona filtro por país se especificado
+        if country_code:
+            params["country_codes"] = country_code
+        
         try:
             response = requests.get(OPEN_METEO_GEOCODING_URL, params=params, timeout=10)
             response.raise_for_status()
             payload = response.json()
             results = payload.get("results", [])
             if results:
-                return results
+                # Filtra apenas cidades do Brasil se country_code for BR
+                if country_code:
+                    results = [r for r in results if r.get('country_code', '').upper() == country_code.upper()]
+                if results:
+                    return results[:count]  # Retorna apenas o número solicitado
         except Exception:
             continue
     return []
 
 
-@lru_cache(maxsize=64)
 def fetch_external_temperature_from_api(
     latitude: float,
     longitude: float,
@@ -149,38 +156,73 @@ def fetch_external_temperature_from_api(
     """Baixa temperatura externa horária via Open-Meteo para o período informado."""
     if start_ts is None or end_ts is None:
         return None
-    start = pd.to_datetime(start_ts).tz_localize(None)
-    end = pd.to_datetime(end_ts).tz_localize(None)
-    if start > end:
-        start, end = end, start
-    params = {
-        "latitude": float(latitude),
-        "longitude": float(longitude),
-        "start_date": start.date().isoformat(),
-        "end_date": end.date().isoformat(),
-        "hourly": "temperature_2m",
-        "timezone": tz or "auto",
-        "temperature_unit": "celsius"
-    }
-    response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    hourly = data.get("hourly") or {}
-    times = hourly.get("time")
-    temps = hourly.get("temperature_2m")
-    if not times or temps is None:
-        raise ValueError("Resposta da API sem série de temperatura horária.")
-    df = pd.DataFrame(
-        {
-            "timestamp": pd.to_datetime(times, errors="coerce"),
-            "temp_externa": temps
+    
+    try:
+        start = pd.to_datetime(start_ts).tz_localize(None)
+        end = pd.to_datetime(end_ts).tz_localize(None)
+        if start > end:
+            start, end = end, start
+        
+        # Verifica se as datas são muito antigas (Open-Meteo Archive tem limitações)
+        # A API geralmente tem dados de 1940 até alguns dias atrás
+        hoje = pd.Timestamp.now()
+        if end > hoje:
+            end = hoje
+        if start > hoje:
+            return None
+        
+        params = {
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "start_date": start.date().isoformat(),
+            "end_date": end.date().isoformat(),
+            "hourly": "temperature_2m",
+            "timezone": tz or "auto",
+            "temperature_unit": "celsius"
         }
-    )
-    df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-    if df.empty:
-        return None
-    df.index = df.index.tz_localize(None)
-    return df
+        
+        response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Verifica se há erros na resposta
+        if "error" in data:
+            raise ValueError(f"API retornou erro: {data.get('reason', 'Erro desconhecido')}")
+        
+        hourly = data.get("hourly") or {}
+        times = hourly.get("time")
+        temps = hourly.get("temperature_2m")
+        
+        if not times or temps is None:
+            # Tenta verificar se há mensagem de erro na resposta
+            error_msg = data.get("error", {}).get("reason", "Resposta da API sem série de temperatura horária.")
+            raise ValueError(f"API não retornou dados: {error_msg}")
+        
+        if len(times) == 0 or len(temps) == 0:
+            raise ValueError("API retornou lista vazia de dados de temperatura.")
+        
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(times, errors="coerce"),
+                "temp_externa": temps
+            }
+        )
+        df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        
+        if df.empty:
+            return None
+        
+        df.index = df.index.tz_localize(None)
+        return df
+        
+    except requests.exceptions.Timeout:
+        raise Exception("Timeout ao consultar API Open-Meteo. Tente novamente.")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Erro de conexão com API Open-Meteo: {str(e)}")
+    except ValueError as e:
+        raise
+    except Exception as e:
+        raise Exception(f"Erro inesperado ao buscar dados: {str(e)}")
 
 
 def calcular_metricas_energeticas(df: pd.DataFrame, temp_max: float) -> Dict[str, Optional[float]]:
@@ -1222,7 +1264,9 @@ def main():
     # Sidebar - Configurações
     st.sidebar.header("Configurações")
     
-    csv_dir = st.sidebar.text_input("Diretório dos CSVs", value=".")
+    # Diretório fixo dos CSVs
+    csv_dir = "Dados de entrada pré instalação"
+    
     fonte_externa = st.sidebar.selectbox(
         "Fonte dos dados de temperatura externa",
         ["Nenhum", "Arquivo CSV", "API Open-Meteo"],
@@ -1230,9 +1274,7 @@ def main():
     )
     
     external_csv = ""
-    cidade_query = ""
     selected_location: Optional[Dict] = None
-    geocode_results: List[Dict] = []
     
     if fonte_externa == "Arquivo CSV":
         external_csv = st.sidebar.text_input(
@@ -1241,135 +1283,192 @@ def main():
             help="Informe um arquivo com timestamp e temperatura externa."
         )
     elif fonte_externa == "API Open-Meteo":
-        # Inicializa o estado se não existir
+        # Inicializa estados
         if 'selected_city' not in st.session_state:
             st.session_state['selected_city'] = None
-        if 'cidade_search_text' not in st.session_state:
-            st.session_state['cidade_search_text'] = ""
         if 'geocode_cache' not in st.session_state:
             st.session_state['geocode_cache'] = {}
-        if 'all_cities_list' not in st.session_state:
-            st.session_state['all_cities_list'] = []
+        if 'cities_options' not in st.session_state:
+            st.session_state['cities_options'] = []
+        if 'cities_dict' not in st.session_state:
+            st.session_state['cities_dict'] = {}
+        if 'default_city_loaded' not in st.session_state:
+            st.session_state['default_city_loaded'] = False
         
         selected_location = None
         
-        # Campo de busca que funciona como input para o selectbox
-        cidade_query = st.sidebar.text_input(
-            "🔍 Pesquisar cidade",
-            value=st.session_state.get('cidade_search_text', ''),
-            key="cidade_search_input",
-            help="Digite pelo menos 3 caracteres - o dropdown aparecerá abaixo para seleção",
-            placeholder="Digite para buscar (ex: Cabedelo)..."
-        )
-        
-        # Busca cidades quando há texto suficiente
-        if cidade_query.strip() and len(cidade_query.strip()) >= 3:
-            cache_key = cidade_query.strip().lower()
-            if cache_key in st.session_state['geocode_cache']:
-                geocode_results = st.session_state['geocode_cache'][cache_key]
-            else:
-                with st.sidebar:
-                    with st.spinner("🔍 Buscando..."):
-                        geocode_results = geocode_city(cidade_query)
-                        if geocode_results:
-                            st.session_state['geocode_cache'][cache_key] = geocode_results
+        # Funções auxiliares para carregar cidades
+        def _buscar_cidades_na_api():
+            """Busca cidades na API (fallback quando não há CSV)"""
+            cidades_iniciais = [
+                "Cabedelo, PB", "João Pessoa, PB", "Campina Grande, PB",
+                "Recife, PE", "Salvador, BA", "Fortaleza, CE",
+                "São Paulo, SP", "Rio de Janeiro, RJ", "Brasília, DF",
+                "Belo Horizonte, MG", "Curitiba, PR", "Porto Alegre, RS",
+                "Manaus, AM", "Belém, PA", "Natal, RN"
+            ]
             
-            if geocode_results:
-                st.session_state['all_cities_list'] = geocode_results
-                st.session_state['cidade_search_text'] = cidade_query
-        elif not cidade_query.strip():
-            # Limpa a lista quando o campo está vazio
-            st.session_state['all_cities_list'] = []
-            st.session_state['cidade_search_text'] = ""
+            for cidade_query in cidades_iniciais:
+                cache_key = cidade_query.lower()
+                if cache_key not in st.session_state['geocode_cache']:
+                    try:
+                        results = geocode_city(cidade_query, count=3, country_code="BR")
+                        if results:
+                            st.session_state['geocode_cache'][cache_key] = results
+                            for cidade in results:
+                                nome = cidade.get('name', '')
+                                admin = cidade.get('admin1') or cidade.get('country', '')
+                                pais = cidade.get('country_code', '')
+                                label = f"{nome}"
+                                if admin:
+                                    label += f", {admin}"
+                                if pais:
+                                    label += f" ({pais.upper()})"
+                                
+                                if label not in st.session_state['cities_dict']:
+                                    st.session_state['cities_options'].append(label)
+                                    st.session_state['cities_dict'][label] = cidade
+                    except Exception:
+                        continue
+            
+            # Define Cabedelo como padrão
+            if not st.session_state.get('selected_city'):
+                cabedelo_results = st.session_state['geocode_cache'].get('cabedelo, pb', [])
+                if cabedelo_results:
+                    for cidade in cabedelo_results:
+                        nome = cidade.get('name', '').lower()
+                        admin = cidade.get('admin1', '').lower()
+                        if 'cabedelo' in nome and ('paraíba' in admin or 'paraiba' in admin):
+                            st.session_state['selected_city'] = cidade
+                            break
+                    if not st.session_state.get('selected_city'):
+                        st.session_state['selected_city'] = cabedelo_results[0]
+            
+            st.session_state['cities_options'].sort()
+        
+        def _salvar_cache_em_csv(cache_file: Path):
+            """Salva as cidades em cache para um arquivo CSV"""
+            try:
+                import json
+                dados = []
+                for label, cidade in st.session_state['cities_dict'].items():
+                    dados.append({
+                        'label': label,
+                        'name': cidade.get('name', ''),
+                        'admin1': cidade.get('admin1', ''),
+                        'country': cidade.get('country', ''),
+                        'country_code': cidade.get('country_code', 'BR'),
+                        'latitude': cidade.get('latitude', 0),
+                        'longitude': cidade.get('longitude', 0),
+                        'timezone': cidade.get('timezone', ''),
+                        'elevation': cidade.get('elevation', 0),
+                        'dados_completos': json.dumps(cidade, ensure_ascii=False)
+                    })
+                
+                if dados:
+                    df = pd.DataFrame(dados)
+                    df = df.sort_values('label')
+                    df.to_csv(cache_file, index=False, encoding='utf-8-sig')
+            except Exception:
+                pass  # Silenciosamente falha se não conseguir salvar
+        
+        # Carrega cidades do arquivo CSV (muito mais rápido que buscar na API)
+        cache_file = Path("cache_cidades_openmeteo.csv")
+        
+        if not st.session_state.get('default_city_loaded'):
+            with st.sidebar:
+                with st.spinner("🔍 Carregando cidades..."):
+                    # Tenta carregar do arquivo CSV
+                    if cache_file.exists():
+                        try:
+                            df_cache = pd.read_csv(cache_file, encoding='utf-8-sig')
+                            import json
+                            
+                            for _, row in df_cache.iterrows():
+                                label = row['label']
+                                # Recupera dados completos do JSON
+                                try:
+                                    cidade = json.loads(row['dados_completos'])
+                                except:
+                                    # Se não tiver JSON, reconstrói do CSV
+                                    cidade = {
+                                        'name': row['name'],
+                                        'admin1': row.get('admin1', ''),
+                                        'country': row.get('country', ''),
+                                        'country_code': row.get('country_code', 'BR'),
+                                        'latitude': float(row.get('latitude', 0)),
+                                        'longitude': float(row.get('longitude', 0)),
+                                        'timezone': row.get('timezone', ''),
+                                        'elevation': float(row.get('elevation', 0))
+                                    }
+                                
+                                if label not in st.session_state['cities_dict']:
+                                    st.session_state['cities_options'].append(label)
+                                    st.session_state['cities_dict'][label] = cidade
+                            
+                            # Define Cabedelo como cidade padrão selecionada
+                            if not st.session_state.get('selected_city'):
+                                for label, cidade in st.session_state['cities_dict'].items():
+                                    nome = cidade.get('name', '').lower()
+                                    admin = cidade.get('admin1', '').lower()
+                                    if 'cabedelo' in nome and ('paraíba' in admin or 'paraiba' in admin):
+                                        st.session_state['selected_city'] = cidade
+                                        break
+                            
+                            # Ordena as opções alfabeticamente
+                            st.session_state['cities_options'].sort()
+                            
+                        except Exception as e:
+                            st.warning(f"Erro ao carregar cache: {e}. Buscando na API...")
+                            # Fallback: busca na API se o CSV falhar
+                            _buscar_cidades_na_api()
+                    else:
+                        # Se não existe o arquivo, busca na API e cria o CSV
+                        st.info("📥 Arquivo de cache não encontrado. Buscando cidades na API...")
+                        _buscar_cidades_na_api()
+                        _salvar_cache_em_csv(cache_file)
+            
+            st.session_state['default_city_loaded'] = True
         
         # Prepara lista de opções para o selectbox
-        opcoes_cidades = []
-        cidade_dict = {}
+        opcoes_cidades = st.session_state['cities_options'].copy()
         
-        # Se há cidade selecionada, adiciona ela como primeira opção
+        # Garante que há pelo menos uma opção
+        if not opcoes_cidades:
+            opcoes_cidades = ["Carregando..."]
+        
+        # Determina índice padrão (cidade selecionada)
+        default_idx = 0
         if st.session_state.get('selected_city'):
-            selected_city = st.session_state['selected_city']
-            cidade_nome = selected_city.get('name', '')
-            admin = selected_city.get('admin1') or selected_city.get('country', '')
-            pais_code = selected_city.get('country_code', '')
-            cidade_label = f"{cidade_nome}"
+            selected = st.session_state['selected_city']
+            nome = selected.get('name', '')
+            admin = selected.get('admin1') or selected.get('country', '')
+            pais = selected.get('country_code', '')
+            label_atual = f"{nome}"
             if admin:
-                cidade_label += f", {admin}"
-            if pais_code:
-                cidade_label += f" ({pais_code})"
-            opcoes_cidades.append(cidade_label)
-            cidade_dict[cidade_label] = selected_city
-        
-        # Adiciona outras cidades encontradas
-        for item in st.session_state.get('all_cities_list', []):
-            cidade_nome = item.get('name', '')
-            admin = item.get('admin1') or item.get('country', '')
-            pais_code = item.get('country_code', '')
-            cidade_label = f"{cidade_nome}"
-            if admin:
-                cidade_label += f", {admin}"
-            if pais_code:
-                cidade_label += f" ({pais_code})"
+                label_atual += f", {admin}"
+            if pais:
+                label_atual += f" ({pais.upper()})"
             
-            # Evita duplicatas
-            if cidade_label not in cidade_dict:
-                opcoes_cidades.append(cidade_label)
-                cidade_dict[cidade_label] = item
+            if label_atual in opcoes_cidades:
+                default_idx = opcoes_cidades.index(label_atual)
         
-        # SELECTBOX ÚNICO - aparece quando há opções
-        if opcoes_cidades:
-            # Determina o índice padrão
-            default_idx = None
-            if st.session_state.get('selected_city'):
-                selected_city = st.session_state['selected_city']
-                cidade_nome = selected_city.get('name', '')
-                admin = selected_city.get('admin1') or selected_city.get('country', '')
-                pais_code = selected_city.get('country_code', '')
-                cidade_label = f"{cidade_nome}"
-                if admin:
-                    cidade_label += f", {admin}"
-                if pais_code:
-                    cidade_label += f" ({pais_code})"
-                if cidade_label in opcoes_cidades:
-                    default_idx = opcoes_cidades.index(cidade_label)
-            
-            cidade_selecionada = st.sidebar.selectbox(
-                "↓ Selecione abaixo",
-                options=opcoes_cidades,
-                index=default_idx if default_idx is not None else 0,
-                key="cidade_selectbox",
-                help="Selecione uma cidade da lista"
-            )
-            
-            # Se uma cidade foi selecionada
-            if cidade_selecionada and cidade_selecionada in cidade_dict:
-                selected_location = cidade_dict[cidade_selecionada]
-                st.session_state['selected_city'] = selected_location
-                st.session_state['selected_city_name'] = cidade_selecionada
-                
-                # Mostra informações da cidade selecionada
-                st.sidebar.success(f"✓ **{selected_location.get('name')}** selecionada")
-                st.sidebar.caption(
-                    f"📍 Lat: {selected_location.get('latitude'):.2f}° / Lon: {selected_location.get('longitude'):.2f}°\n"
-                    f"🕐 Fuso horário: {selected_location.get('timezone', 'auto')}"
-                )
-        else:
-            # Se não há opções, mostra mensagem instruindo a buscar
-            if cidade_query.strip() and len(cidade_query.strip()) >= 3:
-                st.sidebar.warning("⚠️ Nenhuma cidade encontrada. Tente outro termo.")
-            elif cidade_query.strip() and len(cidade_query.strip()) < 3:
-                st.sidebar.info("ℹ️ Digite pelo menos 3 caracteres para buscar.")
-            else:
-                # Mostra cidade selecionada anteriormente se houver
-                if st.session_state.get('selected_city'):
-                    selected_location = st.session_state['selected_city']
-                    st.sidebar.info(f"📍 Cidade selecionada: **{selected_location.get('name')}**")
-                    st.sidebar.caption(
-                        f"Lat: {selected_location.get('latitude'):.2f}° / Lon: {selected_location.get('longitude'):.2f}°"
-                    )
+        # SELECTBOX ÚNICO - o Streamlit permite digitar para filtrar opções existentes
+        cidade_selecionada = st.sidebar.selectbox(
+            "🌍 Cidade",
+            options=opcoes_cidades,
+            index=default_idx if opcoes_cidades else 0,
+            key="cidade_selectbox_final",
+            help="Digite para filtrar ou selecione uma cidade. Cabedelo já está carregado."
+        )
         
-        # Usa a cidade do estado se não foi selecionada nesta execução
-        if not selected_location and st.session_state.get('selected_city'):
+        # Atualiza cidade selecionada
+        if cidade_selecionada and cidade_selecionada in st.session_state['cities_dict']:
+            selected_location = st.session_state['cities_dict'][cidade_selecionada]
+            st.session_state['selected_city'] = selected_location
+        
+        # Garante selected_location
+        if st.session_state.get('selected_city') and not selected_location:
             selected_location = st.session_state['selected_city']
     
     temp_min = st.sidebar.number_input("Temperatura mínima ideal (°C)", value=15.0)
@@ -1394,27 +1493,44 @@ def main():
                 except Exception as exc:
                     external_error = f"Erro ao ler CSV externo: {exc}"
                     external_df = None
-            elif fonte_externa == "API Open-Meteo" and selected_location:
-                try:
-                    start_ts = internal_df.index.min()
-                    end_ts = internal_df.index.max()
-                    external_df = fetch_external_temperature_from_api(
-                        selected_location.get("latitude"),
-                        selected_location.get("longitude"),
-                        start_ts,
-                        end_ts,
-                        selected_location.get("timezone")
-                    )
-                    if external_df is None or external_df.empty:
-                        external_error = "API não retornou dados de temperatura para o período informado."
-                    else:
-                        external_success = (
-                            f"Temperatura externa obtida via Open-Meteo para {selected_location.get('name')} "
-                            f"({selected_location.get('country_code')})."
-                        )
-                except Exception as exc:
-                    external_error = f"Falha ao consultar API Open-Meteo: {exc}"
-                    external_df = None
+            elif fonte_externa == "API Open-Meteo":
+                if not selected_location:
+                    external_error = "⚠️ Selecione uma cidade para buscar dados de temperatura externa."
+                else:
+                    try:
+                        start_ts = internal_df.index.min()
+                        end_ts = internal_df.index.max()
+                        
+                        # Valida coordenadas
+                        lat = selected_location.get("latitude")
+                        lon = selected_location.get("longitude")
+                        if lat is None or lon is None:
+                            external_error = "Coordenadas inválidas para a cidade selecionada."
+                        else:
+                            with st.spinner(f"🌡️ Buscando dados de temperatura para {selected_location.get('name')}..."):
+                                external_df = fetch_external_temperature_from_api(
+                                    lat,
+                                    lon,
+                                    start_ts,
+                                    end_ts,
+                                    selected_location.get("timezone")
+                                )
+                            
+                            if external_df is None or external_df.empty:
+                                external_error = (
+                                    f"API não retornou dados de temperatura para {selected_location.get('name')} "
+                                    f"no período de {start_ts.date()} a {end_ts.date()}. "
+                                    f"Verifique se as datas estão dentro do período disponível na API."
+                                )
+                            else:
+                                external_success = (
+                                    f"✅ Temperatura externa obtida via Open-Meteo para {selected_location.get('name')} "
+                                    f"({selected_location.get('country_code')}). "
+                                    f"Total de {len(external_df)} medições carregadas."
+                                )
+                    except Exception as exc:
+                        external_error = f"❌ Falha ao consultar API Open-Meteo: {str(exc)}"
+                        external_df = None
             
             if external_df is not None and not external_df.empty:
                 internal_df = internal_df.join(external_df, how="outer")
@@ -1430,11 +1546,17 @@ def main():
                         .bfill()
                     )
                     internal_df = internal_df.sort_index()
+        
+        # Exibe mensagens de sucesso ou erro
+        if external_success:
+            st.sidebar.success(external_success)
+        if external_error:
+            st.sidebar.error(f"⚠️ {external_error}")
     
     # Variável de exportação será definida depois dos filtros
 
     if internal_df is None or len(sensor_cols) == 0:
-        st.error("Nenhum dado de sensor encontrado. Verifique o diretório dos CSVs.")
+        st.error("Nenhum dado de sensor encontrado. Verifique se há arquivos CSV na pasta 'Dados de entrada pré instalação'.")
         return
     
     # Informações gerais
