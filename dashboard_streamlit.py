@@ -1286,20 +1286,15 @@ def main():
         # Inicializa estados
         if 'selected_city' not in st.session_state:
             st.session_state['selected_city'] = None
-        if 'geocode_cache' not in st.session_state:
-            st.session_state['geocode_cache'] = {}
-        if 'cities_options' not in st.session_state:
-            st.session_state['cities_options'] = []
-        if 'cities_dict' not in st.session_state:
-            st.session_state['cities_dict'] = {}
-        if 'default_city_loaded' not in st.session_state:
-            st.session_state['default_city_loaded'] = False
         
         selected_location = None
         
-        # Funções auxiliares para carregar cidades
-        def _buscar_cidades_na_api():
-            """Busca cidades na API (fallback quando não há CSV)"""
+        # Arquivo onde as cidades são salvas
+        cidades_file = Path("cidades_openmeteo.csv")
+        
+        # Função para buscar cidades na API e salvar no arquivo
+        def _buscar_e_salvar_cidades():
+            """Busca cidades na API e salva no arquivo CSV"""
             cidades_iniciais = [
                 "Cabedelo, PB", "João Pessoa, PB", "Campina Grande, PB",
                 "Recife, PE", "Salvador, BA", "Fortaleza, CE",
@@ -1308,130 +1303,102 @@ def main():
                 "Manaus, AM", "Belém, PA", "Natal, RN"
             ]
             
+            todas_cidades = []
+            cache_dict = {}
+            
             for cidade_query in cidades_iniciais:
-                cache_key = cidade_query.lower()
-                if cache_key not in st.session_state['geocode_cache']:
-                    try:
-                        results = geocode_city(cidade_query, count=3, country_code="BR")
-                        if results:
-                            st.session_state['geocode_cache'][cache_key] = results
-                            for cidade in results:
-                                nome = cidade.get('name', '')
-                                admin = cidade.get('admin1') or cidade.get('country', '')
-                                pais = cidade.get('country_code', '')
-                                label = f"{nome}"
-                                if admin:
-                                    label += f", {admin}"
-                                if pais:
-                                    label += f" ({pais.upper()})"
-                                
-                                if label not in st.session_state['cities_dict']:
-                                    st.session_state['cities_options'].append(label)
-                                    st.session_state['cities_dict'][label] = cidade
-                    except Exception:
-                        continue
+                try:
+                    results = geocode_city(cidade_query, count=3, country_code="BR")
+                    if results:
+                        for cidade in results:
+                            nome = cidade.get('name', '')
+                            admin = cidade.get('admin1') or cidade.get('country', '')
+                            pais = cidade.get('country_code', '')
+                            label = f"{nome}"
+                            if admin:
+                                label += f", {admin}"
+                            if pais:
+                                label += f" ({pais.upper()})"
+                            
+                            # Evita duplicatas
+                            if label not in cache_dict:
+                                cache_dict[label] = True
+                                todas_cidades.append({
+                                    'label': label,
+                                    'name': nome,
+                                    'admin1': cidade.get('admin1', ''),
+                                    'country': cidade.get('country', ''),
+                                    'country_code': pais,
+                                    'latitude': cidade.get('latitude', 0),
+                                    'longitude': cidade.get('longitude', 0),
+                                    'timezone': cidade.get('timezone', ''),
+                                    'elevation': cidade.get('elevation', 0)
+                                })
+                except Exception:
+                    continue
             
-            # Define Cabedelo como padrão
-            if not st.session_state.get('selected_city'):
-                cabedelo_results = st.session_state['geocode_cache'].get('cabedelo, pb', [])
-                if cabedelo_results:
-                    for cidade in cabedelo_results:
-                        nome = cidade.get('name', '').lower()
-                        admin = cidade.get('admin1', '').lower()
-                        if 'cabedelo' in nome and ('paraíba' in admin or 'paraiba' in admin):
-                            st.session_state['selected_city'] = cidade
-                            break
-                    if not st.session_state.get('selected_city'):
-                        st.session_state['selected_city'] = cabedelo_results[0]
-            
-            st.session_state['cities_options'].sort()
+            # Salva no arquivo CSV
+            if todas_cidades:
+                df = pd.DataFrame(todas_cidades)
+                df = df.sort_values('label')
+                df.to_csv(cidades_file, index=False, encoding='utf-8-sig')
+                return df
+            return None
         
-        def _salvar_cache_em_csv(cache_file: Path):
-            """Salva as cidades em cache para um arquivo CSV"""
-            try:
-                import json
-                dados = []
-                for label, cidade in st.session_state['cities_dict'].items():
-                    dados.append({
-                        'label': label,
-                        'name': cidade.get('name', ''),
-                        'admin1': cidade.get('admin1', ''),
-                        'country': cidade.get('country', ''),
-                        'country_code': cidade.get('country_code', 'BR'),
-                        'latitude': cidade.get('latitude', 0),
-                        'longitude': cidade.get('longitude', 0),
-                        'timezone': cidade.get('timezone', ''),
-                        'elevation': cidade.get('elevation', 0),
-                        'dados_completos': json.dumps(cidade, ensure_ascii=False)
-                    })
-                
-                if dados:
-                    df = pd.DataFrame(dados)
-                    df = df.sort_values('label')
-                    df.to_csv(cache_file, index=False, encoding='utf-8-sig')
-            except Exception:
-                pass  # Silenciosamente falha se não conseguir salvar
-        
-        # Carrega cidades do arquivo CSV (muito mais rápido que buscar na API)
-        cache_file = Path("cache_cidades_openmeteo.csv")
-        
-        if not st.session_state.get('default_city_loaded'):
+        # Carrega cidades do arquivo (ou busca e salva se não existir)
+        if 'cities_loaded' not in st.session_state:
             with st.sidebar:
                 with st.spinner("🔍 Carregando cidades..."):
-                    # Tenta carregar do arquivo CSV
-                    if cache_file.exists():
+                    if cidades_file.exists():
                         try:
-                            df_cache = pd.read_csv(cache_file, encoding='utf-8-sig')
-                            import json
-                            
-                            for _, row in df_cache.iterrows():
-                                label = row['label']
-                                # Recupera dados completos do JSON
-                                try:
-                                    cidade = json.loads(row['dados_completos'])
-                                except:
-                                    # Se não tiver JSON, reconstrói do CSV
-                                    cidade = {
-                                        'name': row['name'],
-                                        'admin1': row.get('admin1', ''),
-                                        'country': row.get('country', ''),
-                                        'country_code': row.get('country_code', 'BR'),
-                                        'latitude': float(row.get('latitude', 0)),
-                                        'longitude': float(row.get('longitude', 0)),
-                                        'timezone': row.get('timezone', ''),
-                                        'elevation': float(row.get('elevation', 0))
-                                    }
-                                
-                                if label not in st.session_state['cities_dict']:
-                                    st.session_state['cities_options'].append(label)
-                                    st.session_state['cities_dict'][label] = cidade
-                            
-                            # Define Cabedelo como cidade padrão selecionada
-                            if not st.session_state.get('selected_city'):
-                                for label, cidade in st.session_state['cities_dict'].items():
-                                    nome = cidade.get('name', '').lower()
-                                    admin = cidade.get('admin1', '').lower()
-                                    if 'cabedelo' in nome and ('paraíba' in admin or 'paraiba' in admin):
-                                        st.session_state['selected_city'] = cidade
-                                        break
-                            
-                            # Ordena as opções alfabeticamente
-                            st.session_state['cities_options'].sort()
-                            
+                            df_cidades = pd.read_csv(cidades_file, encoding='utf-8-sig')
                         except Exception as e:
-                            st.warning(f"Erro ao carregar cache: {e}. Buscando na API...")
-                            # Fallback: busca na API se o CSV falhar
-                            _buscar_cidades_na_api()
+                            st.warning(f"Erro ao ler arquivo de cidades: {e}. Buscando na API...")
+                            df_cidades = _buscar_e_salvar_cidades()
                     else:
-                        # Se não existe o arquivo, busca na API e cria o CSV
-                        st.info("📥 Arquivo de cache não encontrado. Buscando cidades na API...")
-                        _buscar_cidades_na_api()
-                        _salvar_cache_em_csv(cache_file)
-            
-            st.session_state['default_city_loaded'] = True
+                        st.info("📥 Arquivo de cidades não encontrado. Buscando na API...")
+                        df_cidades = _buscar_e_salvar_cidades()
+                    
+                    if df_cidades is not None and len(df_cidades) > 0:
+                        # Prepara dicionário de cidades
+                        cities_dict = {}
+                        cities_options = []
+                        
+                        for _, row in df_cidades.iterrows():
+                            label = row['label']
+                            cidade = {
+                                'name': row['name'],
+                                'admin1': row.get('admin1', ''),
+                                'country': row.get('country', ''),
+                                'country_code': row.get('country_code', 'BR'),
+                                'latitude': float(row.get('latitude', 0)),
+                                'longitude': float(row.get('longitude', 0)),
+                                'timezone': row.get('timezone', ''),
+                                'elevation': float(row.get('elevation', 0))
+                            }
+                            cities_dict[label] = cidade
+                            cities_options.append(label)
+                        
+                        # Salva no session_state
+                        st.session_state['cities_dict'] = cities_dict
+                        st.session_state['cities_options'] = cities_options
+                        
+                        # Define Cabedelo como cidade padrão selecionada
+                        if not st.session_state.get('selected_city'):
+                            for label, cidade in cities_dict.items():
+                                nome = cidade.get('name', '').lower()
+                                admin = cidade.get('admin1', '').lower()
+                                if 'cabedelo' in nome and ('paraíba' in admin or 'paraiba' in admin):
+                                    st.session_state['selected_city'] = cidade
+                                    break
+                        
+                        st.session_state['cities_loaded'] = True
+                    else:
+                        st.error("Não foi possível carregar as cidades.")
+                        st.session_state['cities_loaded'] = True
         
         # Prepara lista de opções para o selectbox
-        opcoes_cidades = st.session_state['cities_options'].copy()
+        opcoes_cidades = st.session_state.get('cities_options', []).copy()
         
         # Garante que há pelo menos uma opção
         if not opcoes_cidades:
@@ -1463,8 +1430,9 @@ def main():
         )
         
         # Atualiza cidade selecionada
-        if cidade_selecionada and cidade_selecionada in st.session_state['cities_dict']:
-            selected_location = st.session_state['cities_dict'][cidade_selecionada]
+        cities_dict = st.session_state.get('cities_dict', {})
+        if cidade_selecionada and cidade_selecionada in cities_dict:
+            selected_location = cities_dict[cidade_selecionada]
             st.session_state['selected_city'] = selected_location
         
         # Garante selected_location
@@ -1597,16 +1565,29 @@ def main():
         filtered_df = internal_df[
             (internal_df.index.date >= date_range[0]) & 
             (internal_df.index.date <= date_range[1])
-        ]
+        ].copy()
     else:
-        filtered_df = internal_df
+        filtered_df = internal_df.copy()
     
     # Seleção de sensores
     selected_sensors = st.sidebar.multiselect(
-        "Sensores para Visualizar",
+        "Sensores para análise",
         options=sensor_cols,
         default=sensor_cols
     )
+    
+    # Recalcula valores médios usando apenas os sensores selecionados
+    if selected_sensors:
+        filtered_df["temp_interna_media"] = filtered_df[selected_sensors].mean(axis=1)
+        filtered_df["temp_interna_min"] = filtered_df[selected_sensors].min(axis=1)
+        filtered_df["temp_interna_max"] = filtered_df[selected_sensors].max(axis=1)
+        filtered_df["temp_interna_std"] = filtered_df[selected_sensors].std(axis=1)
+    else:
+        # Se nenhum sensor selecionado, mantém valores originais ou define como NaN
+        filtered_df["temp_interna_media"] = np.nan
+        filtered_df["temp_interna_min"] = np.nan
+        filtered_df["temp_interna_max"] = np.nan
+        filtered_df["temp_interna_std"] = np.nan
     
     # Botão de exportar (último do menu)
     st.sidebar.markdown("---")
