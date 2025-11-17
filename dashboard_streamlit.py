@@ -14,11 +14,25 @@ import re
 from datetime import datetime, timedelta
 from functools import lru_cache
 from scipy import stats
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from io import BytesIO
 import requests
 import warnings
 warnings.filterwarnings('ignore')
+
+# Diretórios fixos para os cenários pré e pós instalação
+PRE_INSTALL_DIR = Path("Dados de entrada pré instalação")
+POST_INSTALL_DIR = Path("Dados de entrada pós instalação") / "sensores_pos"
+
+# Configuração default da cidade (Cabedelo/PB)
+DEFAULT_LOCATION = {
+    "name": "Cabedelo",
+    "admin1": "Paraíba",
+    "country_code": "BR",
+    "latitude": -6.9711,
+    "longitude": -34.8378,
+    "timezone": "America/Fortaleza"
+}
 
 # Configuração da página
 st.set_page_config(
@@ -911,6 +925,201 @@ def load_external_data(filepath: Path):
     
     return result
 
+
+def load_scenario_dataset(label: str, csv_dir: Path, location: Dict) -> Optional[Dict]:
+    """Carrega dados internos e busca automaticamente temperatura externa para um cenário."""
+    df, sensor_cols, metadata = load_internal_data(csv_dir)
+    if df is None or len(sensor_cols) == 0:
+        st.warning(f"⚠️ Nenhum dado encontrado para {label} em {csv_dir}")
+        return None
+
+    df = df.sort_index()
+    start_ts, end_ts = df.index.min(), df.index.max()
+
+    external_df = None
+    try:
+        external_df = fetch_external_temperature_from_api(
+            latitude=location["latitude"],
+            longitude=location["longitude"],
+            start_ts=start_ts,
+            end_ts=end_ts,
+            tz=location.get("timezone")
+        )
+    except Exception as exc:
+        st.warning(f"⚠️ Falha ao obter temperatura externa para {label}: {exc}")
+
+    if external_df is not None and not external_df.empty:
+        df = df.join(external_df, how="outer").sort_index()
+        if "temp_externa" in df.columns:
+            df["temp_externa"] = (
+                df["temp_externa"]
+                .interpolate(method="time")
+                .ffill()
+                .bfill()
+            )
+
+    return {
+        "label": label,
+        "df": df,
+        "sensor_cols": sensor_cols,
+        "metadata": metadata,
+        "start": start_ts,
+        "end": end_ts,
+    }
+
+
+def filter_scenario_dataframe(
+    df: pd.DataFrame,
+    sensor_cols: List[str],
+    selected_sensors: List[str],
+    date_range: Optional[Tuple[datetime, datetime]]
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Aplica filtros de data e sensores ao dataframe do cenário."""
+    filtered = df.copy()
+    if isinstance(filtered.index, pd.DatetimeIndex) and date_range and len(date_range) == 2:
+        start_date, end_date = date_range
+        filtered = filtered[
+            (filtered.index.date >= start_date) &
+            (filtered.index.date <= end_date)
+        ]
+
+    scenario_sensors = [s for s in selected_sensors if s in sensor_cols]
+    if scenario_sensors:
+        filtered["temp_interna_media"] = filtered[scenario_sensors].mean(axis=1)
+        filtered["temp_interna_min"] = filtered[scenario_sensors].min(axis=1)
+        filtered["temp_interna_max"] = filtered[scenario_sensors].max(axis=1)
+        filtered["temp_interna_std"] = filtered[scenario_sensors].std(axis=1)
+    else:
+        filtered["temp_interna_media"] = np.nan
+        filtered["temp_interna_min"] = np.nan
+        filtered["temp_interna_max"] = np.nan
+        filtered["temp_interna_std"] = np.nan
+
+    return filtered, scenario_sensors
+
+
+def compute_degree_hours_from_df(df: pd.DataFrame, column: str, limit: float) -> Optional[float]:
+    """Calcula graus-hora acima do limite para uma coluna específica do dataframe."""
+    if column not in df.columns or not isinstance(df.index, pd.DatetimeIndex):
+        return None
+    serie = pd.to_numeric(df[column], errors="coerce")
+    if serie.dropna().empty:
+        return None
+    dt_hours = df.index.to_series().diff().dt.total_seconds().fillna(0) / 3600.0
+    excedente = (serie - limit).clip(lower=0).fillna(0)
+    return float((excedente * dt_hours).sum())
+
+
+def summarize_scenario(df: pd.DataFrame, temp_max: float) -> Dict[str, Optional[float]]:
+    """Resumo rápido para comparação entre cenários com métricas normalizadas."""
+    summary: Dict[str, Optional[float]] = {
+        "media_interna": None,
+        "min_interna": None,
+        "max_interna": None,
+        "pct_tempo_acima": None,
+        "corr_pearson": None,
+        "gradiente_medio": None,
+        "graus_hora": None,
+        "media_delta": None,
+        "pct_ext_acima": None,
+        "graus_hora_ext": None,
+        "ratio_excursoes": None,
+        "graus_hora_norm": None,
+        "temp_externa_media": None,
+        "amplitude_interna": None,
+        "amplitude_externa": None,
+        "attenuation_factor": None,
+        "std_interna": None,
+        "std_externa": None,
+        "stability_index": None,
+    }
+    if df is None or df.empty or "temp_interna_media" not in df.columns:
+        return summary
+
+    valores = df["temp_interna_media"].dropna()
+    if valores.empty:
+        return summary
+
+    summary["media_interna"] = float(valores.mean())
+    summary["min_interna"] = float(valores.min())
+    summary["max_interna"] = float(valores.max())
+    summary["amplitude_interna"] = float(valores.max() - valores.min())
+    summary["std_interna"] = float(valores.std(ddof=0))
+    acima = (valores > temp_max).sum()
+    summary["pct_tempo_acima"] = float(100 * acima / len(valores))
+
+    if "temp_externa" in df.columns:
+        pares = df[["temp_interna_media", "temp_externa"]].dropna()
+        if len(pares) > 10:
+            gradiente = pares["temp_externa"] - pares["temp_interna_media"]
+            summary["gradiente_medio"] = float(gradiente.mean())
+            summary["corr_pearson"] = float(pares["temp_interna_media"].corr(pares["temp_externa"]))
+            summary["media_delta"] = float((-gradiente).mean())  # interna - externa
+        ext = df["temp_externa"].dropna()
+        if not ext.empty:
+            summary["temp_externa_media"] = float(ext.mean())
+            pct_ext = float(100 * (ext > temp_max).sum() / len(ext))
+            summary["pct_ext_acima"] = pct_ext
+            summary["amplitude_externa"] = float(ext.max() - ext.min())
+            summary["std_externa"] = float(ext.std(ddof=0))
+            if summary["amplitude_externa"] and summary["amplitude_externa"] > 0:
+                summary["attenuation_factor"] = summary["amplitude_interna"] / summary["amplitude_externa"]
+            if summary["std_externa"] and summary["std_externa"] > 0:
+                summary["stability_index"] = summary["std_interna"] / summary["std_externa"]
+
+    metricas = calcular_metricas_energeticas(df, temp_max)
+    summary["graus_hora"] = metricas.get("graus_hora_acima_limite")
+
+    if "temp_externa" in df.columns:
+        graus_hora_ext = compute_degree_hours_from_df(df, "temp_externa", temp_max)
+        summary["graus_hora_ext"] = graus_hora_ext
+        if summary["pct_tempo_acima"] is not None and summary["pct_ext_acima"] and summary["pct_ext_acima"] > 0:
+            summary["ratio_excursoes"] = summary["pct_tempo_acima"] / summary["pct_ext_acima"]
+        if summary["graus_hora"] is not None and graus_hora_ext and graus_hora_ext > 0:
+            summary["graus_hora_norm"] = summary["graus_hora"] / graus_hora_ext
+
+    return summary
+
+
+def render_scenario_section(
+    labels: List[str],
+    renderer,
+    scenario_map: Dict[str, Dict],
+    share_limits: bool = False
+):
+    """Renderiza conteúdo para um ou dois cenários lado a lado."""
+    if len(labels) == 1:
+        renderer(labels[0], st, scenario_map, limits=None, gather_only=False)
+        return
+
+    if not share_limits:
+        columns = st.columns(len(labels))
+        for column, label in zip(columns, labels):
+            with column:
+                st.caption(f"Cenário: **{label}**")
+                renderer(label, column, scenario_map, limits=None, gather_only=False)
+        return
+
+    # Calcula limites comuns APENAS para eixo Y
+    y_mins, y_maxs = [], []
+    for label in labels:
+        scenario_limits = renderer(label, None, scenario_map, limits=None, gather_only=True)
+        if not scenario_limits:
+            continue
+        y_range = scenario_limits.get("y")
+        if y_range:
+            y_mins.append(y_range[0])
+            y_maxs.append(y_range[1])
+    common_limits = None
+    if y_mins and y_maxs:
+        common_limits = {"y": (min(y_mins), max(y_maxs))}
+
+    columns = st.columns(len(labels))
+    for column, label in zip(columns, labels):
+        with column:
+            st.caption(f"Cenário: **{label}**")
+            renderer(label, column, scenario_map, limits=common_limits, gather_only=False)
+
 # ============================================================================
 # FUNÃ‡Ã•ES DE VISUALIZAÃ‡ÃƒO
 # ============================================================================
@@ -1261,333 +1470,110 @@ def main():
     st.title("Dashboard de Análise Térmica - Tecnologia 3TC")
     st.markdown("---")
     
-    # Sidebar - Configurações
     st.sidebar.header("Configurações")
-    
-    # Diretório fixo dos CSVs
-    csv_dir = "Dados de entrada pré instalação"
-    
-    fonte_externa = st.sidebar.selectbox(
-        "Fonte dos dados de temperatura externa",
-        ["Nenhum", "Arquivo CSV", "API Open-Meteo"],
-        index=2
-    )
-    
-    external_csv = ""
-    selected_location: Optional[Dict] = None
-    
-    if fonte_externa == "Arquivo CSV":
-        external_csv = st.sidebar.text_input(
-            "Arquivo CSV Temperatura Externa",
-            value="",
-            help="Informe um arquivo com timestamp e temperatura externa."
-        )
-    elif fonte_externa == "API Open-Meteo":
-        # Inicializa estados
-        if 'selected_city' not in st.session_state:
-            st.session_state['selected_city'] = None
-        
-        selected_location = None
-        
-        # Arquivo onde as cidades são salvas
-        cidades_file = Path("cidades_openmeteo.csv")
-        
-        # Função para buscar cidades na API e salvar no arquivo
-        def _buscar_e_salvar_cidades():
-            """Busca cidades na API e salva no arquivo CSV"""
-            cidades_iniciais = [
-                "Cabedelo, PB", "João Pessoa, PB", "Campina Grande, PB",
-                "Recife, PE", "Salvador, BA", "Fortaleza, CE",
-                "São Paulo, SP", "Rio de Janeiro, RJ", "Brasília, DF",
-                "Belo Horizonte, MG", "Curitiba, PR", "Porto Alegre, RS",
-                "Manaus, AM", "Belém, PA", "Natal, RN"
-            ]
-            
-            todas_cidades = []
-            cache_dict = {}
-            
-            for cidade_query in cidades_iniciais:
-                try:
-                    results = geocode_city(cidade_query, count=3, country_code="BR")
-                    if results:
-                        for cidade in results:
-                            nome = cidade.get('name', '')
-                            admin = cidade.get('admin1') or cidade.get('country', '')
-                            pais = cidade.get('country_code', '')
-                            label = f"{nome}"
-                            if admin:
-                                label += f", {admin}"
-                            if pais:
-                                label += f" ({pais.upper()})"
-                            
-                            # Evita duplicatas
-                            if label not in cache_dict:
-                                cache_dict[label] = True
-                                todas_cidades.append({
-                                    'label': label,
-                                    'name': nome,
-                                    'admin1': cidade.get('admin1', ''),
-                                    'country': cidade.get('country', ''),
-                                    'country_code': pais,
-                                    'latitude': cidade.get('latitude', 0),
-                                    'longitude': cidade.get('longitude', 0),
-                                    'timezone': cidade.get('timezone', ''),
-                                    'elevation': cidade.get('elevation', 0)
-                                })
-                except Exception:
-                    continue
-            
-            # Salva no arquivo CSV
-            if todas_cidades:
-                df = pd.DataFrame(todas_cidades)
-                df = df.sort_values('label')
-                df.to_csv(cidades_file, index=False, encoding='utf-8-sig')
-                return df
-            return None
-        
-        # Carrega cidades do arquivo (ou busca e salva se não existir)
-        if 'cities_loaded' not in st.session_state:
-            with st.sidebar:
-                with st.spinner("🔍 Carregando cidades..."):
-                    if cidades_file.exists():
-                        try:
-                            df_cidades = pd.read_csv(cidades_file, encoding='utf-8-sig')
-                        except Exception as e:
-                            st.warning(f"Erro ao ler arquivo de cidades: {e}. Buscando na API...")
-                            df_cidades = _buscar_e_salvar_cidades()
-                    else:
-                        st.info("📥 Arquivo de cidades não encontrado. Buscando na API...")
-                        df_cidades = _buscar_e_salvar_cidades()
-                    
-                    if df_cidades is not None and len(df_cidades) > 0:
-                        # Prepara dicionário de cidades
-                        cities_dict = {}
-                        cities_options = []
-                        
-                        for _, row in df_cidades.iterrows():
-                            label = row['label']
-                            cidade = {
-                                'name': row['name'],
-                                'admin1': row.get('admin1', ''),
-                                'country': row.get('country', ''),
-                                'country_code': row.get('country_code', 'BR'),
-                                'latitude': float(row.get('latitude', 0)),
-                                'longitude': float(row.get('longitude', 0)),
-                                'timezone': row.get('timezone', ''),
-                                'elevation': float(row.get('elevation', 0))
-                            }
-                            cities_dict[label] = cidade
-                            cities_options.append(label)
-                        
-                        # Salva no session_state
-                        st.session_state['cities_dict'] = cities_dict
-                        st.session_state['cities_options'] = cities_options
-                        
-                        # Define Cabedelo como cidade padrão selecionada
-                        if not st.session_state.get('selected_city'):
-                            for label, cidade in cities_dict.items():
-                                nome = cidade.get('name', '').lower()
-                                admin = cidade.get('admin1', '').lower()
-                                if 'cabedelo' in nome and ('paraíba' in admin or 'paraiba' in admin):
-                                    st.session_state['selected_city'] = cidade
-                                    break
-                        
-                        st.session_state['cities_loaded'] = True
-                    else:
-                        st.error("Não foi possível carregar as cidades.")
-                        st.session_state['cities_loaded'] = True
-        
-        # Prepara lista de opções para o selectbox
-        opcoes_cidades = st.session_state.get('cities_options', []).copy()
-        
-        # Garante que há pelo menos uma opção
-        if not opcoes_cidades:
-            opcoes_cidades = ["Carregando..."]
-        
-        # Determina índice padrão (cidade selecionada)
-        default_idx = 0
-        if st.session_state.get('selected_city'):
-            selected = st.session_state['selected_city']
-            nome = selected.get('name', '')
-            admin = selected.get('admin1') or selected.get('country', '')
-            pais = selected.get('country_code', '')
-            label_atual = f"{nome}"
-            if admin:
-                label_atual += f", {admin}"
-            if pais:
-                label_atual += f" ({pais.upper()})"
-            
-            if label_atual in opcoes_cidades:
-                default_idx = opcoes_cidades.index(label_atual)
-        
-        # SELECTBOX ÚNICO - o Streamlit permite digitar para filtrar opções existentes
-        cidade_selecionada = st.sidebar.selectbox(
-            "🌍 Cidade",
-            options=opcoes_cidades,
-            index=default_idx if opcoes_cidades else 0,
-            key="cidade_selectbox_final",
-            help="Digite para filtrar ou selecione uma cidade. Cabedelo já está carregado."
-        )
-        
-        # Atualiza cidade selecionada
-        cities_dict = st.session_state.get('cities_dict', {})
-        if cidade_selecionada and cidade_selecionada in cities_dict:
-            selected_location = cities_dict[cidade_selecionada]
-            st.session_state['selected_city'] = selected_location
-        
-        # Garante selected_location
-        if st.session_state.get('selected_city') and not selected_location:
-            selected_location = st.session_state['selected_city']
-    
     temp_min = st.sidebar.number_input("Temperatura mínima ideal (°C)", value=15.0)
     temp_max = st.sidebar.number_input("Temperatura máxima ideal (°C)", value=30.0)
-    
-    # Carrega dados
-    with st.spinner("Carregando dados..."):
-        internal_df, sensor_cols, metadados_sensores = load_internal_data(Path(csv_dir))
-        
-        external_df = None
-        external_success = None
-        external_error = None
-        
-        if internal_df is not None and len(internal_df):
-            if fonte_externa == "Arquivo CSV" and external_csv:
-                try:
-                    external_df = load_external_data(Path(external_csv))
-                    if external_df is None or external_df.empty:
-                        external_error = "Não foi possível interpretar o CSV de temperatura externa."
-                    else:
-                        external_success = f"Temperatura externa carregada de {external_csv}."
-                except Exception as exc:
-                    external_error = f"Erro ao ler CSV externo: {exc}"
-                    external_df = None
-            elif fonte_externa == "API Open-Meteo":
-                if not selected_location:
-                    external_error = "⚠️ Selecione uma cidade para buscar dados de temperatura externa."
-                else:
-                    try:
-                        start_ts = internal_df.index.min()
-                        end_ts = internal_df.index.max()
-                        
-                        # Valida coordenadas
-                        lat = selected_location.get("latitude")
-                        lon = selected_location.get("longitude")
-                        if lat is None or lon is None:
-                            external_error = "Coordenadas inválidas para a cidade selecionada."
-                        else:
-                            with st.spinner(f"🌡️ Buscando dados de temperatura para {selected_location.get('name')}..."):
-                                external_df = fetch_external_temperature_from_api(
-                                    lat,
-                                    lon,
-                                    start_ts,
-                                    end_ts,
-                                    selected_location.get("timezone")
-                                )
-                            
-                            if external_df is None or external_df.empty:
-                                external_error = (
-                                    f"API não retornou dados de temperatura para {selected_location.get('name')} "
-                                    f"no período de {start_ts.date()} a {end_ts.date()}. "
-                                    f"Verifique se as datas estão dentro do período disponível na API."
-                                )
-                            else:
-                                external_success = (
-                                    f"✅ Temperatura externa obtida via Open-Meteo para {selected_location.get('name')} "
-                                    f"({selected_location.get('country_code')}). "
-                                    f"Total de {len(external_df)} medições carregadas."
-                                )
-                    except Exception as exc:
-                        external_error = f"❌ Falha ao consultar API Open-Meteo: {str(exc)}"
-                        external_df = None
-            
-            if external_df is not None and not external_df.empty:
-                internal_df = internal_df.join(external_df, how="outer")
-                if "temp_externa" in internal_df.columns:
-                    internal_df["temp_externa"] = pd.to_numeric(
-                        internal_df["temp_externa"],
-                        errors="coerce"
-                    )
-                    internal_df["temp_externa"] = (
-                        internal_df["temp_externa"]
-                        .interpolate(method="time")
-                        .ffill()
-                        .bfill()
-                    )
-                    internal_df = internal_df.sort_index()
-        
-        # Exibe mensagens de sucesso ou erro
-        if external_success:
-            st.sidebar.success(external_success)
-        if external_error:
-            st.sidebar.error(f"⚠️ {external_error}")
-    
-    # Variável de exportação será definida depois dos filtros
 
-    if internal_df is None or len(sensor_cols) == 0:
-        st.error("Nenhum dado de sensor encontrado. Verifique se há arquivos CSV na pasta 'Dados de entrada pré instalação'.")
+    scenario_configs = [
+        ("Pré 3TC", PRE_INSTALL_DIR),
+        ("Pós 3TC", POST_INSTALL_DIR),
+    ]
+
+    scenarios: Dict[str, Dict] = {}
+    with st.spinner("Carregando cenários pré e pós..."):
+        for label, directory in scenario_configs:
+            scenario = load_scenario_dataset(label, directory, DEFAULT_LOCATION)
+            if scenario:
+                scenarios[label] = scenario
+
+    if not scenarios:
+        st.error("Não foi possível carregar nenhum cenário. Verifique as pastas fixas de dados.")
         return
-    
-    # Informações gerais
-    st.header("Visão Geral")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Número de Sensores", len(sensor_cols))
-    
-    with col2:
-        st.metric("Total de Medições", f"{len(internal_df):,}")
-    
-    with col3:
-        if "temp_interna_media" in internal_df.columns:
-            temp_media = internal_df["temp_interna_media"].mean()
-            st.metric("Temperatura Média Interna", f"{temp_media:.2f}°C")
-    
-    with col4:
-        if "temp_interna_media" in internal_df.columns:
-            excursoes = (internal_df["temp_interna_media"] > temp_max).sum()
-            st.metric("Excursões Acima do Limite", f"{excursoes}")
-    
-    # Filtros de data
+
+    scenario_labels = list(scenarios.keys())
+    overall_start = min(s["start"].date() for s in scenarios.values())
+    overall_end = max(s["end"].date() for s in scenarios.values())
+
     st.sidebar.markdown("---")
-    st.sidebar.header("Filtros")
-    
-    min_date = internal_df.index.min().date()
-    max_date = internal_df.index.max().date()
-    
+    st.sidebar.header("Filtros Globais")
     date_range = st.sidebar.date_input(
         "Período de Análise",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
+        value=(overall_start, overall_end),
+        min_value=overall_start,
+        max_value=overall_end
     )
-    
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        filtered_df = internal_df[
-            (internal_df.index.date >= date_range[0]) & 
-            (internal_df.index.date <= date_range[1])
-        ].copy()
-    else:
-        filtered_df = internal_df.copy()
-    
-    # Seleção de sensores
+
+    all_sensors = sorted({sensor for s in scenarios.values() for sensor in s["sensor_cols"]})
     selected_sensors = st.sidebar.multiselect(
-        "Sensores para análise",
-        options=sensor_cols,
-        default=sensor_cols
+        "Sensores considerados",
+        options=all_sensors,
+        default=all_sensors
     )
-    
-    # Recalcula valores médios usando apenas os sensores selecionados
-    if selected_sensors:
-        filtered_df["temp_interna_media"] = filtered_df[selected_sensors].mean(axis=1)
-        filtered_df["temp_interna_min"] = filtered_df[selected_sensors].min(axis=1)
-        filtered_df["temp_interna_max"] = filtered_df[selected_sensors].max(axis=1)
-        filtered_df["temp_interna_std"] = filtered_df[selected_sensors].std(axis=1)
+
+    current_scenario_label = st.sidebar.selectbox(
+        "Cenário exibido nas abas",
+        options=scenario_labels
+    )
+    comparison_labels = st.sidebar.multiselect(
+        "Cenários na comparação",
+        options=scenario_labels,
+        default=scenario_labels
+    )
+
+    filtered_scenarios: Dict[str, Dict] = {}
+    for label, scenario in scenarios.items():
+        filtered_df, active_sensors = filter_scenario_dataframe(
+            scenario["df"],
+            scenario["sensor_cols"],
+            selected_sensors,
+            date_range if isinstance(date_range, tuple) and len(date_range) == 2 else None
+        )
+        filtered_scenarios[label] = {
+            **scenario,
+            "df": filtered_df,
+            "active_sensors": active_sensors,
+            "summary": summarize_scenario(filtered_df, temp_max)
+        }
+
+    current = filtered_scenarios[current_scenario_label]
+    current_df = current["df"]
+    current_sensors = current["active_sensors"]
+    metadados_sensores = current.get("metadata", {})
+
+    if current_df.empty or current_df["temp_interna_media"].dropna().empty:
+        st.error(f"Não há dados válidos para o cenário {current_scenario_label} dentro dos filtros selecionados.")
+        return
+
+    dual_labels: List[str]
+    if (
+        "Pré 3TC" in filtered_scenarios
+        and "Pós 3TC" in filtered_scenarios
+        and not filtered_scenarios["Pré 3TC"]["df"].empty
+        and not filtered_scenarios["Pós 3TC"]["df"].empty
+    ):
+        dual_labels = ["Pré 3TC", "Pós 3TC"]
     else:
-        # Se nenhum sensor selecionado, mantém valores originais ou define como NaN
-        filtered_df["temp_interna_media"] = np.nan
-        filtered_df["temp_interna_min"] = np.nan
-        filtered_df["temp_interna_max"] = np.nan
-        filtered_df["temp_interna_std"] = np.nan
+        dual_labels = [current_scenario_label]
+    
+    st.caption(
+        f"Cenário atual: **{current_scenario_label}** "
+        f"({current['start'].strftime('%d/%m/%Y %H:%M')} → {current['end'].strftime('%d/%m/%Y %H:%M')})"
+    )
+    if len(dual_labels) == 2:
+        st.info("Visualizações em duas colunas comparam diretamente o período **Pré 3TC** (esquerda) e **Pós 3TC** (direita).")
+    
+    st.header("Visão Geral")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Sensores selecionados", len(current_sensors))
+    with col2:
+        st.metric("Total de medições", f"{len(current_df):,}")
+    with col3:
+        if "temp_interna_media" in current_df.columns:
+            st.metric("Temperatura média interna", f"{current_df['temp_interna_media'].mean():.2f}°C")
+    with col4:
+        if "temp_interna_media" in current_df.columns:
+            st.metric("Excursões > limite", int((current_df["temp_interna_media"] > temp_max).sum()))
     
     # Botão de exportar (último do menu)
     st.sidebar.markdown("---")
@@ -1595,14 +1581,15 @@ def main():
     
     # Lógica de exportação (executada DEPOIS do botão ser criado)
     if exportar_excel:
-        if internal_df is not None and sensor_cols:
+        scenario_sensor_cols = [s for s in current["sensor_cols"] if s in current_df.columns]
+        if current_df is not None and scenario_sensor_cols:
             hum_map = {
                 sensor: f"{sensor}_umidade"
-                for sensor in sensor_cols
-                if f"{sensor}_umidade" in internal_df.columns
+                for sensor in scenario_sensor_cols
+                if f"{sensor}_umidade" in current_df.columns
             }
             temp_long = (
-                internal_df[sensor_cols]
+                current_df[scenario_sensor_cols]
                 .reset_index()
                 .rename(columns={"index": "timestamp"})
                 .melt(id_vars="timestamp", var_name="sensor", value_name="temperatura")
@@ -1612,9 +1599,9 @@ def main():
                 st.sidebar.warning("Não há medições válidas para exportar.")
             else:
                 # Adiciona temperatura externa se disponível
-                if "temp_externa" in internal_df.columns:
+                if "temp_externa" in current_df.columns:
                     temp_externa_df = (
-                        internal_df[["temp_externa"]]
+                        current_df[["temp_externa"]]
                         .reset_index()
                         .rename(columns={"index": "timestamp"})
                         .dropna(subset=["temp_externa"])
@@ -1634,7 +1621,7 @@ def main():
                     hum_cols = list(hum_map.values())
                     rename_map = {col: sensor for sensor, col in hum_map.items()}
                     hum_long = (
-                        internal_df[hum_cols]
+                        current_df[hum_cols]
                         .reset_index()
                         .rename(columns={"index": "timestamp"})
                         .rename(columns=rename_map)
@@ -1665,7 +1652,7 @@ def main():
             st.sidebar.warning("Carregue os dados dos sensores antes de exportar.")
     
     # Tabs principais
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "Evolução Temporal",
         "Correlação",
         "Gradiente Térmico",
@@ -1673,121 +1660,182 @@ def main():
         "Comparação de Sensores",
         "Excursões",
         "Metadados dos Sensores",
-        "Métricas Chave"
+        "Métricas Chave",
+        "Comparativo Pré × Pós"
     ])
     
     with tab1:
         st.subheader("Evolução da Temperatura ao Longo do Tempo")
         show_external = st.checkbox("Mostrar Temperatura Externa", value=True)
-        
-        # Filtra sensores selecionados
-        if selected_sensors:
-            plot_df = filtered_df[selected_sensors + ["temp_interna_media", "temp_interna_min", "temp_interna_max"]]
-            if "temp_externa" in filtered_df.columns and show_external:
-                plot_df["temp_externa"] = filtered_df["temp_externa"]
-        else:
-            plot_df = filtered_df[["temp_interna_media", "temp_interna_min", "temp_interna_max"]]
-            if "temp_externa" in filtered_df.columns and show_external:
-                plot_df["temp_externa"] = filtered_df["temp_externa"]
-        
-        fig = plot_temperature_over_time(plot_df, selected_sensors if selected_sensors else [], show_external)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Estatísticas resumidas
-        if "temp_interna_media" in filtered_df.columns:
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Média", f"{filtered_df['temp_interna_media'].mean():.2f}°C")
-            with col2:
-                st.metric("Mínima", f"{filtered_df['temp_interna_media'].min():.2f}°C")
-            with col3:
-                st.metric("Máxima", f"{filtered_df['temp_interna_media'].max():.2f}°C")
-            with col4:
-                st.metric("Desvio Padrão", f"{filtered_df['temp_interna_media'].std():.2f}°C")
+
+        def render_evolucao(label: str, container, scenario_map, limits=None, gather_only=False):
+            scenario = scenario_map.get(label)
+            df = scenario["df"]
+            sensors = scenario["active_sensors"]
+            if df is None or df.empty or df["temp_interna_media"].dropna().empty:
+                if gather_only:
+                    return {}
+                container.info("Sem dados suficientes para este cenário nos filtros atuais.")
+                return
+            base_cols = ["temp_interna_media", "temp_interna_min", "temp_interna_max"]
+            sensor_cols = [s for s in sensors if s in df.columns]
+            plot_cols = [c for c in sensor_cols + base_cols if c in df.columns]
+            plot_df = df[plot_cols].copy()
+            show_ext = show_external and "temp_externa" in df.columns
+            if show_ext:
+                plot_df["temp_externa"] = df["temp_externa"]
+            numeric_df = plot_df.select_dtypes(include=[np.number])
+            y_min = float(numeric_df.min().min()) if not numeric_df.empty else None
+            y_max = float(numeric_df.max().max()) if not numeric_df.empty else None
+            if gather_only:
+                return {"y": (y_min, y_max)}
+            fig = plot_temperature_over_time(plot_df, sensor_cols, show_ext)
+            if limits:
+                if limits.get("y"):
+                    fig.update_yaxes(range=list(limits["y"]))
+            container.plotly_chart(fig, use_container_width=True)
+            if "temp_interna_media" in df.columns:
+                col_a, col_b, col_c, col_d = container.columns(4)
+                col_a.metric("Média", f"{df['temp_interna_media'].mean():.2f}°C")
+                col_b.metric("Mínima", f"{df['temp_interna_media'].min():.2f}°C")
+                col_c.metric("Máxima", f"{df['temp_interna_media'].max():.2f}°C")
+                col_d.metric("Desvio Padrão", f"{df['temp_interna_media'].std():.2f}°C")
+
+        render_scenario_section(dual_labels, render_evolucao, filtered_scenarios, share_limits=True)
     
     with tab2:
         st.subheader("Correlação: Temperatura Externa vs Interna")
-        
-        if "temp_externa" in filtered_df.columns and "temp_interna_media" in filtered_df.columns:
-            fig = plot_correlation_scatter(filtered_df, "temp_interna_media", "temp_externa")
+
+        def render_correlacao(label: str, container, scenario_map, limits=None, gather_only=False):
+            scenario = scenario_map.get(label)
+            df = scenario["df"]
+            if df is None or df.empty or "temp_externa" not in df.columns or "temp_interna_media" not in df.columns:
+                if gather_only:
+                    return {}
+                container.warning("Temperatura externa indisponível para este cenário.")
+                return
+            data = df[["temp_interna_media", "temp_externa"]].dropna()
+            if len(data) < 10:
+                if gather_only:
+                    return {}
+                container.info("Dados insuficientes para correlação neste cenário.")
+                return
+            y_min, y_max = float(data["temp_interna_media"].min()), float(data["temp_interna_media"].max())
+            if gather_only:
+                return {"y": (y_min, y_max)}
+            fig = plot_correlation_scatter(df, "temp_interna_media", "temp_externa")
+            if limits:
+                if limits.get("y"):
+                    fig.update_yaxes(range=list(limits["y"]))
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Métricas de correlação
-                data = filtered_df[["temp_interna_media", "temp_externa"]].dropna()
-                if len(data) > 10:
-                    corr_pearson, p_pearson = stats.pearsonr(data["temp_externa"], data["temp_interna_media"])
-                    corr_spearman, p_spearman = stats.spearmanr(data["temp_externa"], data["temp_interna_media"])
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Correlação de Pearson", f"{corr_pearson:.4f}", 
-                                 delta=f"p = {p_pearson:.2e}")
-                    with col2:
-                        st.metric("Correlação de Spearman", f"{corr_spearman:.4f}",
-                                 delta=f"p = {p_spearman:.2e}")
-                    
-                    # Interpretação
-                    if abs(corr_pearson) > 0.7:
-                        st.info("**Correlação Forte**: A temperatura interna está fortemente dependente da externa. O isolamento pode ser melhorado.")
-                    elif abs(corr_pearson) > 0.4:
-                        st.warning("**Correlação Moderada**: A temperatura interna tem dependência moderada da externa.")
-                    else:
-                        st.success("**Correlação Fraca**: A temperatura interna é pouco dependente da externa. Bom isolamento!")
-        else:
-            st.warning("âš ï¸ Dados de temperatura externa não disponíveis. Carregue um arquivo CSV com dados externos.")
+                container.plotly_chart(fig, use_container_width=True)
+            corr_pearson, p_pearson = stats.pearsonr(data["temp_externa"], data["temp_interna_media"])
+            corr_spearman, p_spearman = stats.spearmanr(data["temp_externa"], data["temp_interna_media"])
+            col_a, col_b = container.columns(2)
+            col_a.metric("Pearson", f"{corr_pearson:.4f}", delta=f"p = {p_pearson:.2e}")
+            col_b.metric("Spearman", f"{corr_spearman:.4f}", delta=f"p = {p_spearman:.2e}")
+            if abs(corr_pearson) > 0.7:
+                container.info("Correlação forte: interna segue externamente quase em tempo real.")
+            elif abs(corr_pearson) > 0.4:
+                container.warning("Correlação moderada.")
+            else:
+                container.success("Correlação fraca: isolamento desacopla bem o ambiente.")
+
+        render_scenario_section(dual_labels, render_correlacao, filtered_scenarios, share_limits=True)
     
     with tab3:
         st.subheader("Gradiente Térmico (Externa - Interna)")
-        
-        if "temp_externa" in filtered_df.columns and "temp_interna_media" in filtered_df.columns:
-            fig = plot_thermal_gradient(filtered_df, "temp_interna_media", "temp_externa")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Estatísticas do gradiente
-            data = filtered_df[["temp_interna_media", "temp_externa"]].dropna()
+
+        def render_gradiente(label: str, container, scenario_map, limits=None, gather_only=False):
+            scenario = scenario_map.get(label)
+            df = scenario["df"]
+            if df is None or df.empty or "temp_externa" not in df.columns or "temp_interna_media" not in df.columns:
+                if gather_only:
+                    return {}
+                container.warning("Temperatura externa indisponível para este cenário.")
+                return
+            data = df[["temp_interna_media", "temp_externa"]].dropna()
+            if data.empty:
+                if gather_only:
+                    return {}
+                container.info("Dados insuficientes para calcular gradiente.")
+                return
             gradiente = data["temp_externa"] - data["temp_interna_media"]
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Gradiente Médio", f"{gradiente.mean():.2f}°C")
-            with col2:
-                st.metric("Gradiente Mínimo", f"{gradiente.min():.2f}°C")
-            with col3:
-                st.metric("Gradiente Máximo", f"{gradiente.max():.2f}°C")
-            
-            # Classificação
+            y_min, y_max = float(gradiente.min()), float(gradiente.max())
+            if gather_only:
+                return {"y": (y_min, y_max)}
+            fig = plot_thermal_gradient(df, "temp_interna_media", "temp_externa")
+            if limits:
+                if limits.get("y"):
+                    fig.update_yaxes(range=list(limits["y"]))
+            container.plotly_chart(fig, use_container_width=True)
+            col_a, col_b, col_c = container.columns(3)
+            col_a.metric("Gradiente Médio", f"{gradiente.mean():.2f}°C")
+            col_b.metric("Mínimo", f"{gradiente.min():.2f}°C")
+            col_c.metric("Máximo", f"{gradiente.max():.2f}°C")
             if gradiente.mean() > 5:
-                st.success("**Excelente Isolamento**: Gradiente médio > 5°C")
+                container.success("Excelente isolamento (externa significativamente maior).")
             elif gradiente.mean() > 2:
-                st.info("**Bom Isolamento**: Gradiente médio entre 2-5°C")
+                container.info("Bom isolamento.")
             elif gradiente.mean() > 0:
-                st.warning("**Isolamento Moderado**: Gradiente médio entre 0-2°C")
+                container.warning("Isolamento moderado.")
             else:
-                st.error("**Isolamento Ineficiente**: Gradiente negativo (interna mais quente que externa)")
-        else:
-            st.warning("Dados de temperatura externa não disponíveis.")
+                container.error("Isolamento ineficiente (interno mais quente).")
+
+        render_scenario_section(dual_labels, render_gradiente, filtered_scenarios, share_limits=True)
     
     with tab4:
         st.subheader("Mapa de Calor - Temperatura por Hora e Dia")
-        if "temp_interna_media" in filtered_df.columns:
-            fig = plot_heatmap_by_period(filtered_df, "temp_interna_media")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Dados insuficientes para mapa de calor.")
+
+        def render_heatmap(label: str, container, scenario_map, limits=None, gather_only=False):
+            scenario = scenario_map.get(label)
+            df = scenario["df"]
+            if df is None or df.empty or "temp_interna_media" not in df.columns:
+                if gather_only:
+                    return {}
+                container.warning("Sem temperatura interna disponível.")
+                return
+            if df["temp_interna_media"].dropna().empty:
+                if gather_only:
+                    return {}
+                container.info("Dados insuficientes para mapa de calor.")
+                return
+            if gather_only:
+                return {}
+            fig = plot_heatmap_by_period(df, "temp_interna_media")
+            container.plotly_chart(fig, use_container_width=True)
+
+        render_scenario_section(dual_labels, render_heatmap, filtered_scenarios, share_limits=True)
     
     with tab5:
         st.subheader("Comparação entre Sensores")
-        if selected_sensors:
-            plot_df = filtered_df[selected_sensors]
-            fig = plot_sensor_comparison(plot_df, selected_sensors)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Tabela de estatísticas
-            st.subheader("Estatísticas por Sensor")
+
+        def render_sensor_comparison(label: str, container, scenario_map, limits=None, gather_only=False):
+            scenario = scenario_map.get(label)
+            df = scenario["df"]
+            sensors = scenario["active_sensors"]
+            if not sensors:
+                if gather_only:
+                    return {}
+                container.info("Nenhum sensor ativo neste cenário com os filtros atuais.")
+                return
+            plot_df = df[sensors].dropna(how="all")
+            if plot_df.empty:
+                if gather_only:
+                    return {}
+                container.info("Dados insuficientes para comparar sensores.")
+                return
+            y_min = float(plot_df.min().min())
+            y_max = float(plot_df.max().max())
+            if gather_only:
+                return {"y": (y_min, y_max)}
+            fig = plot_sensor_comparison(plot_df, sensors)
+            if limits and limits.get("y"):
+                fig.update_yaxes(range=list(limits["y"]))
+            container.plotly_chart(fig, use_container_width=True)
             stats_data = []
-            for sensor in selected_sensors:
-                values = filtered_df[sensor].dropna()
+            for sensor in sensors:
+                values = df[sensor].dropna()
                 if len(values) > 0:
                     stats_data.append({
                         "Sensor": sensor,
@@ -1795,39 +1843,78 @@ def main():
                         "Mín (°C)": f"{values.min():.2f}",
                         "Máx (°C)": f"{values.max():.2f}",
                         "Desv. Pad. (°C)": f"{values.std():.2f}",
-                        "Excursões > 30°C": int((values > temp_max).sum())
+                        "Excursões > limite": int((values > temp_max).sum())
                     })
-            
             if stats_data:
-                st.dataframe(pd.DataFrame(stats_data), use_container_width=True)
-        else:
-            st.info("Selecione sensores na barra lateral para visualizar.")
+                container.dataframe(pd.DataFrame(stats_data), use_container_width=True)
+
+        render_scenario_section(dual_labels, render_sensor_comparison, filtered_scenarios, share_limits=True)
     
     with tab6:
         st.subheader("Análise de Excursões Acima do Limite")
-        if selected_sensors:
-            fig = plot_excursions_over_time(filtered_df, selected_sensors, threshold=temp_max)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Resumo de excursões
-            st.subheader("Resumo de Excursões")
-            exc_data = []
-            for sensor in selected_sensors:
-                values = filtered_df[sensor].dropna()
-                if len(values) > 0:
-                    excursoes = (values > temp_max).sum()
-                    pct = (excursoes / len(values)) * 100
-                    exc_data.append({
-                        "Sensor": sensor,
-                        "Total de Excursões": excursoes,
-                        "% do Tempo": f"{pct:.2f}%",
-                        "Temperatura Máxima": f"{values.max():.2f}°C"
-                    })
-            
-            if exc_data:
-                st.dataframe(pd.DataFrame(exc_data), use_container_width=True)
-        else:
-            st.info("Selecione sensores na barra lateral para visualizar.")
+
+        def render_excursions(label: str, container, scenario_map, limits=None, gather_only=False):
+            scenario = scenario_map.get(label)
+            df = scenario["df"]
+            sensors = scenario["active_sensors"]
+            if not sensors:
+                if gather_only:
+                    return {}
+                container.info("Nenhum sensor ativo neste cenário com os filtros atuais.")
+                return
+            excursions = []
+            for sensor in sensors:
+                series = df[[sensor]].dropna()
+                if series.empty:
+                    continue
+                excursions.append(series[sensor])
+            if not excursions:
+                if gather_only:
+                    return {}
+                container.info("Dados insuficientes para excursões.")
+                return
+            y_series = []
+            daily_values = []
+            for sensor in sensors:
+                series = df[[sensor]].dropna()
+                if series.empty:
+                    continue
+                exc = (series[sensor] > temp_max).astype(int)
+                grouped = exc.groupby(exc.index.date).sum()
+                if not grouped.empty:
+                    y_series.append(grouped.max())
+                    daily_values.append(grouped)
+            if not y_series:
+                if gather_only:
+                    return {}
+                container.info("Dados insuficientes para excursões.")
+                return
+            y_min = 0
+            y_max = float(max(y_series))
+            if gather_only:
+                return {"y": (y_min, y_max)}
+            fig = plot_excursions_over_time(df, sensors, threshold=temp_max)
+            if limits:
+                if limits.get("y"):
+                    fig.update_yaxes(range=list(limits["y"]))
+            container.plotly_chart(fig, use_container_width=True)
+            exc_rows = []
+            for sensor in sensors:
+                values = df[sensor].dropna()
+                if len(values) == 0:
+                    continue
+                excursoes = (values > temp_max).sum()
+                pct = (excursoes / len(values)) * 100
+                exc_rows.append({
+                    "Sensor": sensor,
+                    "Total de Excursões": excursoes,
+                    "% do Tempo": f"{pct:.2f}%",
+                    "Temperatura Máxima": f"{values.max():.2f}°C"
+                })
+            if exc_rows:
+                container.dataframe(pd.DataFrame(exc_rows), use_container_width=True)
+
+        render_scenario_section(dual_labels, render_excursions, filtered_scenarios, share_limits=True)
     
     with tab7:
         st.subheader("Informações Detalhadas dos Sensores")
@@ -1896,7 +1983,7 @@ def main():
 
     with tab8:
         st.subheader("Métricas Chave de Desempenho Térmico")
-        metricas = calcular_metricas_energeticas(filtered_df, temp_max)
+        metricas = calcular_metricas_energeticas(current_df, temp_max)
         if metricas["delta_t_medio"] is None:
             st.warning("É necessário carregar temperatura interna média e temperatura externa para calcular as métricas.")
         else:
@@ -1974,6 +2061,186 @@ def main():
                 "As métricas consideram o intervalo filtrado. Para análise comparativa futura, "
                 "carregue também os dados dos sensores com a nova tecnologia e utilize os mesmos filtros."
             )
+
+    with tab9:
+        st.subheader("Comparativo Pré × Pós")
+        if len(comparison_labels) < 2:
+            st.info("Selecione pelo menos dois cenários na barra lateral para comparar.")
+        else:
+            st.markdown(
+                """
+                **Metodologia normalizada**
+
+                - `ΔT médio` = temperatura interna média menos a externa média (literatura de **cooling degree analysis**).
+                - `% tempo > limite (Int)` comparado com `% tempo > limite (Ext)` gera o **Índice de excursões (Int/Ext)**.
+                - `Graus-hora normalizado` = graus-hora internos ÷ graus-hora externos (conceito análogo ao *Cooling Degree Hours*).
+                - `Fator de amortecimento (Int/Ext)` segue ISO 13786/ASHRAE: razão entre amplitudes interna e externa (quanto menor, melhor barreira térmica).
+                - `Índice de estabilidade (σ_int/σ_ext)` indica o quão suavizada está a variabilidade interna em relação ao ambiente externo, usado em estudos de desempenho passivo.
+                Valores menores que 1 apontam ambientes mais resilientes mesmo sob condições externas severas.
+                """
+            )
+            comparison_data = []
+            for label in comparison_labels:
+                scenario_info = filtered_scenarios.get(label)
+                if not scenario_info:
+                    continue
+                summary = scenario_info["summary"]
+                comparison_data.append({
+                    "Cenário": label,
+                    "Período": f"{scenario_info['start'].strftime('%d/%m/%Y')} - {scenario_info['end'].strftime('%d/%m/%Y')}",
+                    "Sensores ativos": len(scenario_info["active_sensors"]),
+                    "Média interna (°C)": summary["media_interna"],
+                    "Min (°C)": summary["min_interna"],
+                    "Max (°C)": summary["max_interna"],
+                    "ΔT médio (int-ext)": summary["media_delta"],
+                    "% tempo > limite (Int)": summary["pct_tempo_acima"],
+                    "% tempo > limite (Ext)": summary["pct_ext_acima"],
+                    "Índice excursões (Int/Ext)": summary["ratio_excursoes"],
+                    "Gradiente médio (°C)": summary["gradiente_medio"],
+                    "Correlação externa": summary["corr_pearson"],
+                    "Graus-hora acima limite": summary["graus_hora"],
+                    "Graus-hora normalizado": summary["graus_hora_norm"],
+                "Amplitude interna (°C)": summary["amplitude_interna"],
+                "Amplitude externa (°C)": summary["amplitude_externa"],
+                "Fator de amortecimento (Int/Ext)": summary["attenuation_factor"],
+                "Índice de estabilidade (σ_int/σ_ext)": summary["stability_index"],
+                })
+            if comparison_data:
+                comp_df = pd.DataFrame(comparison_data)
+                def style_best(df, better_map):
+                    styler = df.style
+                    for col, mode in better_map.items():
+                        if col not in df.columns:
+                            continue
+                        values = pd.to_numeric(df[col], errors="coerce")
+                        if values.dropna().empty:
+                            continue
+                        target = values.min() if mode == "min" else values.max()
+
+                        def _style_column(col_series):
+                            if col_series.name != col:
+                                return [""] * len(col_series)
+                            styled = []
+                            for val in col_series:
+                                numeric = pd.to_numeric(val, errors="coerce")
+                                if not pd.isna(numeric) and numeric == target:
+                                    styled.append("color: green; font-weight: 600;")
+                                else:
+                                    styled.append("")
+                            return styled
+
+                        styler = styler.apply(_style_column, axis=0)
+                    return styler
+
+                quantitative_cols = [
+                    "Período",
+                    "Sensores ativos",
+                    "Média interna (°C)",
+                    "Min (°C)",
+                    "Max (°C)",
+                    "ΔT médio (int-ext)",
+                    "% tempo > limite (Int)",
+                    "% tempo > limite (Ext)",
+                    "Graus-hora acima limite",
+                ]
+                normalized_cols = [
+                    "Gradiente médio (°C)",
+                    "Correlação externa",
+                    "Índice excursões (Int/Ext)",
+                    "Graus-hora normalizado",
+                    "Amplitude interna (°C)",
+                    "Amplitude externa (°C)",
+                    "Fator de amortecimento (Int/Ext)",
+                    "Índice de estabilidade (σ_int/σ_ext)",
+                ]
+
+                quantitative_map = {
+                    "Média interna (°C)": "min",
+                    "Min (°C)": "min",
+                    "Max (°C)": "min",
+                    "ΔT médio (int-ext)": "min",
+                    "% tempo > limite (Int)": "min",
+                    "% tempo > limite (Ext)": "min",
+                    "Graus-hora acima limite": "min",
+                }
+                normalized_map = {
+                    "Gradiente médio (°C)": "max",
+                    "Correlação externa": "min",
+                    "Índice excursões (Int/Ext)": "min",
+                    "Graus-hora normalizado": "min",
+                    "Amplitude interna (°C)": "min",
+                    "Amplitude externa (°C)": "min",
+                    "Fator de amortecimento (Int/Ext)": "min",
+                    "Índice de estabilidade (σ_int/σ_ext)": "min",
+                }
+
+                st.markdown("#### Indicadores normalizados por temperatura externa")
+                st.markdown(
+                    "- **Gradiente médio**: externa − interna; positivo indica que o interior permaneceu mais frio.\n"
+                    "- **Correlação externa**: quão dependente o interior está da variação externa (menor = melhor isolamento).\n"
+                    "- **Índice de excursões (Int/Ext)**: relação entre % do tempo acima do limite interno e externo.\n"
+                    "- **Graus-hora normalizado**: carga térmica interna excedente proporcional à carga externa.\n"
+                    "- **Amplitude/Fator de amortecimento**: redução das oscilações internas vs. externas (conceito ISO 13786 / ASHRAE).\n"
+                    "- **Índice de estabilidade (σ_int/σ_ext)**: quão estável é o ambiente interno comparado ao externo."
+                )
+                norm_df = comp_df[["Cenário"] + [c for c in normalized_cols if c in comp_df.columns]]
+                st.dataframe(
+                    style_best(norm_df, normalized_map),
+                    use_container_width=True
+                )
+
+                st.markdown("#### Indicadores quantitativos (brutos)")
+                st.markdown(
+                    "- **Média / Min / Max**: estatísticas diretas da temperatura interna.\n"
+                    "- **ΔT médio (int-ext)**: diferença média entre interna e externa (negativo indica ambiente mais quente que o exterior).\n"
+                    "- **% tempo > limite (Int/Ext)** e **Graus-hora**: tempo e energia excedente acima do limite configurado."
+                )
+                quant_df = comp_df[["Cenário"] + [c for c in quantitative_cols if c in comp_df.columns]]
+                st.dataframe(
+                    style_best(quant_df, quantitative_map),
+                    use_container_width=True
+                )
+                # Visual comparativo simples de média e gradiente
+                chart_df = comp_df.set_index("Cenário")
+                # Separa em 4 gráficos individuais devido às unidades distintas
+                graf_cols = st.columns(2)
+                with graf_cols[0]:
+                    fig_media = go.Figure(go.Bar(
+                        x=chart_df.index,
+                        y=chart_df["Média interna (°C)"],
+                        marker_color="#1f77b4",
+                        name="Média interna"
+                    ))
+                    fig_media.update_layout(title="Média interna (°C)", height=350)
+                    st.plotly_chart(fig_media, use_container_width=True)
+                with graf_cols[1]:
+                    fig_grad = go.Figure(go.Bar(
+                        x=chart_df.index,
+                        y=chart_df["Gradiente médio (°C)"],
+                        marker_color="#ff7f0e",
+                        name="Gradiente médio"
+                    ))
+                    fig_grad.update_layout(title="Gradiente médio (°C)", height=350)
+                    st.plotly_chart(fig_grad, use_container_width=True)
+                graf_cols2 = st.columns(2)
+                with graf_cols2[0]:
+                    fig_pct = go.Figure(go.Bar(
+                        x=chart_df.index,
+                        y=chart_df["% tempo > limite (Int)"],
+                        marker_color="#d62728",
+                        name="% tempo > limite"
+                    ))
+                    fig_pct.update_layout(title="% tempo > limite (Int)", height=350)
+                    st.plotly_chart(fig_pct, use_container_width=True)
+                with graf_cols2[1]:
+                    fig_ratio = go.Figure(go.Bar(
+                        x=chart_df.index,
+                        y=chart_df["Índice excursões (Int/Ext)"],
+                        marker_color="#9467bd",
+                        name="Índice excursões"
+                    ))
+                    fig_ratio.update_layout(title="Índice excursões (Int/Ext)", height=350)
+                    st.plotly_chart(fig_ratio, use_container_width=True)
 
 
     # Rodapé
